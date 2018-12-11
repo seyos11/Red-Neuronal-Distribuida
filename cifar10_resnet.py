@@ -22,12 +22,24 @@ from keras.regularizers import l2
 from keras import backend as K
 from keras.models import Model
 from keras.datasets import cifar10
+import horovod as hvd
 import numpy as np
 import os
+
+# Horovod: initialize Horovod.
+hvd.init()
+
+# Horovod: pin GPU to be used to process local rank (one GPU per process)
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
+config.gpu_options.visible_device_list = str(hvd.local_rank())
+K.set_session(tf.Session(config=config))
 
 # Training parameters
 batch_size = 32  # orig paper trained all networks with batch_size=128
 epochs = 200
+###
+epochs = int(math.ceil(hvd.size() / hvd.size()))
 data_augmentation = True
 num_classes = 10
 
@@ -334,24 +346,28 @@ if version == 2:
 else:
     model = resnet_v1(input_shape=input_shape, depth=depth)
 
+# Horovod: adjust learning rate based on number of GPUs.
+opt = keras.optimizers.Adadelta(lr_schedule(0) * hvd.size())
+
+# Horovod: add Horovod Distributed Optimizer.
+opt = hvd.DistributedOptimizer(opt)
+
 model.compile(loss='categorical_crossentropy',
-              optimizer=Adam(lr=lr_schedule(0)),
+              optimizer=opt,
               metrics=['accuracy'])
+##HOROVOD
+callbacks = [
+    # Horovod: broadcast initial variable states from rank 0 to all other processes.
+    # This is necessary to ensure consistent initialization of all workers when
+    # training is started with random weights or restored from a checkpoint.
+    hvd.callbacks.BroadcastGlobalVariablesCallback(0),
+]
 model.summary()
 print(model_type)
 
 # Prepare model model saving directory.
-save_dir = os.path.join(os.getcwd(), 'saved_models')
-model_name = 'cifar10_%s_model.{epoch:03d}.h5' % model_type
-if not os.path.isdir(save_dir):
-    os.makedirs(save_dir)
-filepath = os.path.join(save_dir, model_name)
 
 # Prepare callbacks for model saving and for learning rate adjustment.
-checkpoint = ModelCheckpoint(filepath=filepath,
-                             monitor='val_acc',
-                             verbose=1,
-                             save_best_only=True)
 
 lr_scheduler = LearningRateScheduler(lr_schedule)
 
@@ -360,7 +376,7 @@ lr_reducer = ReduceLROnPlateau(factor=np.sqrt(0.1),
                                patience=5,
                                min_lr=0.5e-6)
 
-callbacks = [checkpoint, lr_reducer, lr_scheduler]
+callbacks = [lr_reducer, lr_scheduler]
 
 # Run training, with or without data augmentation.
 if not data_augmentation:
